@@ -3,13 +3,14 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/lib/pq"
 	"github.com/pkg/errors"
 
-	_ "github.com/lib/pq"
 	"github.com/mattermost/morph/drivers"
 	"github.com/mattermost/morph/models"
 )
@@ -162,6 +163,16 @@ func (pg *Postgres) createSchemaTableIfNotExists() (err error) {
 
 	createTableIfNotExistsQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (version bigint not null primary key, name varchar not null)", pg.config.MigrationsTable)
 	if _, err = pg.conn.ExecContext(ctx, createTableIfNotExistsQuery); err != nil {
+		// Concurrent engine initialization may race on DDL and return a transient serialization error.
+		var pqErr *pq.Error
+
+		if errors.As(err, &pqErr) {
+			switch pqErr.Code {
+			case "40001", "40P01":
+				return nil
+			}
+		}
+
 		return &drivers.DatabaseError{
 			OrigErr: err,
 			Driver:  driverName,
@@ -281,7 +292,7 @@ func (pg *Postgres) AppliedMigrations() (migrations []*models.Migration, err err
 	}
 
 	if err := pg.createSchemaTableIfNotExists(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create schema table: %w", err)
 	}
 
 	query := fmt.Sprintf("SELECT version, name FROM %s", pg.config.MigrationsTable)
