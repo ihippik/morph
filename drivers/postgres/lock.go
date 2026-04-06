@@ -79,9 +79,10 @@ func (m *Mutex) tryLock(ctx context.Context) (bool, error) {
 
 		err2 := m.releaseLock(ctx, now)
 		if err2 == nil { // lock has been released due to expiration
+			m.logger.Println("Morph: lock has been released due to expiration")
 			return true, nil
 		} else {
-			m.logger.Printf("Failed to release lock: %v", err2)
+			m.logger.Printf("Morph: failed to release lock: %v", err2)
 		}
 
 		return false, fmt.Errorf("failed to lock mutex: %w", err)
@@ -174,11 +175,12 @@ func (m *Mutex) Lock(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(waitInterval):
+			m.logger.Println("Morph: wait interval")
 		}
 
 		ok, err := m.tryLock(ctx)
 		if err != nil || !ok {
-			m.logger.Printf("Failed to acquire lock. Trying again: %v\n", err)
+			m.logger.Printf("Morph: Failed to acquire lock. Trying again: %v\n", err)
 			waitInterval = drivers.NextWaitInterval(waitInterval, err)
 			continue
 		}
@@ -188,14 +190,15 @@ func (m *Mutex) Lock(ctx context.Context) error {
 
 	stop := make(chan bool)
 	done := make(chan bool)
+
 	go func() {
 		defer close(done)
 		t := time.NewTicker(drivers.RefreshInterval)
 		for {
 			select {
 			case <-t.C:
-				err := m.refreshLock(ctx)
-				if err != nil {
+				if err := m.refreshLock(ctx); err != nil {
+					m.logger.Println("Morph: refresh lock failed: ", err.Error())
 					return
 				}
 			case <-stop:
@@ -208,6 +211,8 @@ func (m *Mutex) Lock(ctx context.Context) error {
 	m.stopRefresh = stop
 	m.refreshDone = done
 	m.lock.Unlock()
+
+	m.logger.Println("Morph: got DB lock")
 
 	return nil
 }
