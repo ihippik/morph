@@ -37,7 +37,7 @@ type Mutex struct {
 func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (*Mutex, error) {
 	key, err := drivers.MakeLockKey(key)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("make lock key: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), drivers.TTL)
@@ -45,12 +45,12 @@ func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (*Mutex, error) 
 
 	conn, err := pg.db.Conn(context.Background())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get db conn: %w", err)
 	}
 
 	createTableIfNotExistsQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (id varchar(64) PRIMARY KEY, expireat bigint);", drivers.MutexTableName)
 	if _, err = conn.ExecContext(ctx, createTableIfNotExistsQuery); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create table db_lock: %w", err)
 	}
 
 	return &Mutex{
@@ -65,16 +65,17 @@ func (m *Mutex) tryLock(ctx context.Context) (bool, error) {
 	now := time.Now()
 	tx, err := m.conn.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("begin tx: %w", err)
 	}
 	defer m.finalizeTx(tx)
 
 	query := fmt.Sprintf("INSERT INTO %s (id, expireat) VALUES ($1, $2)", drivers.MutexTableName)
 	if _, err := tx.Exec(query, m.key, now.Add(drivers.TTL).Unix()); err != nil {
+		m.finalizeTx(tx)
+
 		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
 			m.logger.Println("DB is locked, going to try acquire the lock if it is expired.")
 		}
-		m.finalizeTx(tx)
 
 		err2 := m.releaseLock(ctx, now)
 		if err2 == nil { // lock has been released due to expiration
@@ -86,9 +87,8 @@ func (m *Mutex) tryLock(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("failed to lock mutex: %w", err)
 	}
 
-	err = tx.Commit()
-	if err != nil {
-		return false, err
+	if err = tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit: %w", err)
 	}
 
 	return true, nil
@@ -97,13 +97,13 @@ func (m *Mutex) tryLock(ctx context.Context) (bool, error) {
 func (m *Mutex) releaseLock(ctx context.Context, t time.Time) error {
 	tx, err := m.conn.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer m.finalizeTx(tx)
 
 	e, err := m.getExpireAt(tx)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetch expireat: %w", err)
 	}
 
 	if t.Unix() < e {
@@ -112,7 +112,7 @@ func (m *Mutex) releaseLock(ctx context.Context, t time.Time) error {
 
 	query := fmt.Sprintf("UPDATE %s SET expireat = $1 WHERE id = $2", drivers.MutexTableName)
 	if err = executeTx(tx, query, t.Add(drivers.TTL).Unix(), m.key); err != nil {
-		return err
+		return fmt.Errorf("unable to set new expireat for mutex: %w", err)
 	}
 
 	err = tx.Commit()
@@ -138,13 +138,13 @@ func (m *Mutex) getExpireAt(tx *sql.Tx) (int64, error) {
 func (m *Mutex) refreshLock(ctx context.Context) error {
 	tx, err := m.conn.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer m.finalizeTx(tx)
 
 	e, err := m.getExpireAt(tx)
 	if err != nil {
-		return err
+		return fmt.Errorf("fetch expireat: %w", err)
 	}
 
 	tmp := time.Unix(e, 0)
