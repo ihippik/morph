@@ -2,9 +2,11 @@ package postgres
 
 import (
 	"context"
+	crand "crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -49,14 +51,16 @@ func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (drivers.Locker,
 		return nil, fmt.Errorf("get db conn: %w", err)
 	}
 
+	sleepWithJitter(1)
+
 	createTableIfNotExistsQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (id varchar(64) PRIMARY KEY, expireat bigint);", drivers.MutexTableName)
 	for attempt := 0; ; attempt++ {
 		if _, err = conn.ExecContext(ctx, createTableIfNotExistsQuery); err == nil {
 			break
 		}
 
-		if isRetryableDDLConflict(err) && attempt < 7 {
-			time.Sleep(time.Duration(attempt+1) * 150 * time.Millisecond)
+		if isRetryableDDLConflict(err) && attempt < 10 {
+			sleepWithJitter(attempt)
 			logger.Println("Morph: retrying DDL conflict (create db_lock)")
 			continue
 		}
@@ -89,6 +93,19 @@ func isRetryableDDLConflict(err error) bool {
 	}
 
 	return strings.Contains(strings.ToLower(err.Error()), "tuple concurrently updated")
+}
+
+func sleepWithJitter(attempt int) {
+	base := time.Duration(attempt+1) * 50 * time.Millisecond
+
+	const jitterMax = int64(300 * time.Millisecond)
+	n, err := crand.Int(crand.Reader, big.NewInt(jitterMax+1))
+	if err != nil {
+		time.Sleep(base)
+		return
+	}
+
+	time.Sleep(base + time.Duration(n.Int64()))
 }
 
 // lock makes a single attempt to lock the mutex, returning true only if successful.
