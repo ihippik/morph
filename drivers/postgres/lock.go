@@ -51,11 +51,12 @@ func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (drivers.Locker,
 		return nil, fmt.Errorf("get db conn: %w", err)
 	}
 
-	sleepWithJitter(1)
+	sleepWithJitter(2)
 
 	createTableIfNotExistsQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (id varchar(64) PRIMARY KEY, expireat bigint);", drivers.MutexTableName)
 	for attempt := 0; ; attempt++ {
 		if _, err = conn.ExecContext(ctx, createTableIfNotExistsQuery); err == nil {
+			logger.Println("Morph: created if not exists db_lock)")
 			break
 		}
 
@@ -64,8 +65,6 @@ func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (drivers.Locker,
 			logger.Println("Morph: retrying DDL conflict (create db_lock)")
 			continue
 		}
-
-		return nil, fmt.Errorf("create table db_lock: %w", err)
 	}
 
 	return &Mutex{
