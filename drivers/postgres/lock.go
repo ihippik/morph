@@ -34,7 +34,7 @@ type Mutex struct {
 // NewMutex creates a mutex with the given key name.
 //
 // returns error if key is empty.
-func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (*Mutex, error) {
+func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (drivers.Locker, error) {
 	key, err := drivers.MakeLockKey(key)
 	if err != nil {
 		return nil, fmt.Errorf("make lock key: %w", err)
@@ -62,7 +62,10 @@ func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (*Mutex, error) 
 
 // lock makes a single attempt to lock the mutex, returning true only if successful.
 func (m *Mutex) tryLock(ctx context.Context) (bool, error) {
+	m.logger.Println("Morph: trying to acquire lock")
+
 	now := time.Now()
+
 	tx, err := m.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("begin tx: %w", err)
@@ -70,11 +73,12 @@ func (m *Mutex) tryLock(ctx context.Context) (bool, error) {
 	defer m.finalizeTx(tx)
 
 	query := fmt.Sprintf("INSERT INTO %s (id, expireat) VALUES ($1, $2)", drivers.MutexTableName)
+
 	if _, err := tx.Exec(query, m.key, now.Add(drivers.TTL).Unix()); err != nil {
 		m.finalizeTx(tx)
 
 		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-			m.logger.Println("DB is locked, going to try acquire the lock if it is expired.")
+			m.logger.Println("Morph: DB is locked, going to try acquire the lock if it is expired.")
 		}
 
 		err2 := m.releaseLock(ctx, now)
@@ -121,14 +125,17 @@ func (m *Mutex) releaseLock(ctx context.Context, t time.Time) error {
 		return fmt.Errorf("unable to set new expireat for mutex: %w", err)
 	}
 
+	m.logger.Println("Morph: lock released successfully")
+
 	return nil
 }
 
 func (m *Mutex) getExpireAt(tx *sql.Tx) (int64, error) {
 	var expireAt int64
-	query := fmt.Sprintf("SELECT expireat FROM %s WHERE id = $1", drivers.MutexTableName)
-	err := tx.QueryRow(query, m.key).Scan(&expireAt)
-	if err != nil {
+
+	query := fmt.Sprintf("SELECT expireat FROM %s WHERE id = $1 FOR UPDATE", drivers.MutexTableName)
+
+	if err := tx.QueryRow(query, m.key).Scan(&expireAt); err != nil {
 		return -1, fmt.Errorf("failed to fetch mutex from db: %w", err)
 	}
 
@@ -149,15 +156,18 @@ func (m *Mutex) refreshLock(ctx context.Context) error {
 	}
 
 	tmp := time.Unix(e, 0)
-	query := fmt.Sprintf("UPDATE %s SET expireat = $1 WHERE id = $2", drivers.MutexTableName)
-	if err = executeTx(tx, query, tmp.Add(drivers.TTL).Unix(), m.key); err != nil {
-		return err
-	}
 
-	err = tx.Commit()
-	if err != nil {
+	query := fmt.Sprintf("UPDATE %s SET expireat = $1 WHERE id = $2", drivers.MutexTableName)
+
+	if err = executeTx(tx, query, tmp.Add(drivers.TTL).Unix(), m.key); err != nil {
 		return fmt.Errorf("unable to refresh expireat for mutex: %w", err)
 	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("unable to refresh expireat for mutex: %w", err)
+	}
+
+	m.logger.Println("Morph: lock refreshed successfully")
 
 	return nil
 }
@@ -236,21 +246,22 @@ func (m *Mutex) Unlock() error {
 
 	// If an error occurs deleting, the mutex will still expire, allowing later retry.
 	query := fmt.Sprintf("DELETE FROM %s WHERE id = $1", drivers.MutexTableName)
-	_, err := m.conn.ExecContext(context.Background(), query, m.key)
-	return err
-}
 
-func executeTx(tx *sql.Tx, query string, args ...interface{}) error {
-	if _, err := tx.Exec(query, args...); err != nil {
-		return err
+	if _, err := m.conn.ExecContext(context.Background(), query, m.key); err != nil {
+		return fmt.Errorf("unable to delete mutex: %w", err)
 	}
 
 	return nil
 }
 
+func executeTx(tx *sql.Tx, query string, args ...interface{}) error {
+	_, err := tx.Exec(query, args...)
+	return err
+}
+
 func (m *Mutex) finalizeTx(tx *sql.Tx) {
 	if err := tx.Rollback(); err != nil && err != sql.ErrTxDone {
-		m.logger.Printf("failed to rollback transaction: %s", err)
+		m.logger.Printf("Morph: failed to rollback transaction: %s", err)
 	}
 }
 
