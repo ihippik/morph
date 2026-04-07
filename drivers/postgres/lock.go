@@ -49,7 +49,18 @@ func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (drivers.Locker,
 	}
 
 	createTableIfNotExistsQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (id varchar(64) PRIMARY KEY, expireat bigint);", drivers.MutexTableName)
-	if _, err = conn.ExecContext(ctx, createTableIfNotExistsQuery); err != nil {
+	for attempt := 0; ; attempt++ {
+		if _, err = conn.ExecContext(ctx, createTableIfNotExistsQuery); err == nil {
+			break
+		}
+
+		var pqErr *pq.Error
+
+		if errors.As(err, &pqErr) && pqErr.Code.Class() == pq.ErrorClass("40") && attempt < 4 {
+			time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+			continue
+		}
+
 		return nil, fmt.Errorf("create table db_lock: %w", err)
 	}
 
