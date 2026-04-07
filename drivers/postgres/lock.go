@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,7 +50,17 @@ func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (drivers.Locker,
 	}
 
 	createTableIfNotExistsQuery := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (id varchar(64) PRIMARY KEY, expireat bigint);", drivers.MutexTableName)
-	if _, err = conn.ExecContext(ctx, createTableIfNotExistsQuery); err != nil {
+	for attempt := 0; ; attempt++ {
+		if _, err = conn.ExecContext(ctx, createTableIfNotExistsQuery); err == nil {
+			break
+		}
+
+		if isRetryableDDLConflict(err) && attempt < 4 {
+			time.Sleep(time.Duration(attempt+1) * 50 * time.Millisecond)
+			logger.Println("Morph: retrying DDL conflict (create db_lock)")
+			continue
+		}
+
 		return nil, fmt.Errorf("create table db_lock: %w", err)
 	}
 
@@ -58,6 +69,26 @@ func (pg *Postgres) NewMutex(key string, logger drivers.Logger) (drivers.Locker,
 		conn:   conn,
 		logger: logger,
 	}, nil
+}
+
+func isRetryableDDLConflict(err error) bool {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		if strings.HasPrefix(string(pqErr.Code), "40") {
+			return true
+		}
+	}
+
+	var stateErr interface {
+		SQLState() string
+	}
+	if errors.As(err, &stateErr) {
+		if strings.HasPrefix(stateErr.SQLState(), "40") {
+			return true
+		}
+	}
+
+	return strings.Contains(strings.ToLower(err.Error()), "tuple concurrently updated")
 }
 
 // lock makes a single attempt to lock the mutex, returning true only if successful.
